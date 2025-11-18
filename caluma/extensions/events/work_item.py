@@ -1,3 +1,4 @@
+from functools import partial
 from django.core.mail import send_mail
 from django.db import transaction
 
@@ -46,31 +47,28 @@ def set_assigned_user(sender, work_item, user, **kwargs):
     work_item.save()
 
 
-def _send_work_item_mail(work_item):
-    """
-    Send the work_item emails.
-
-    This must reside in a separate function in order to be able to patch it in the
-    tests.
-    """
-    link = f"{settings.SELF_URI}/cases/{work_item.case.pk}"
-
+def get_mail_template_and_values(work_item):
     try:
         dossier_nr = work_item.case.document.answers.get(question_id="dossier-nr").value
     except Answer.DoesNotExist:
         dossier_nr = "Not found"
 
-    framework_credit = None
-    payout_amount = None
-    selected_email_texts = email_general
+    format_values = {
+        "link": f"{settings.SELF_URI}/cases/{work_item.case.pk}",
+        "dossier_nr": dossier_nr,
+    }
 
-    if work_item.task.slug == "additional-data":
-        define_amount_work_item = (
-            work_item.case.work_items.filter(task__slug="define-amount")
-            .order_by("-closed_at")
-            .first()
-        )
-        if not (
+    define_amount_work_item_query = work_item.case.work_items.filter(
+        task__slug="define-amount"
+    )
+    is_eca_form = (
+        work_item.case.document.form.slug in settings.EARLY_CAREER_AWARD_FORM_SLUGS
+    )
+    define_amount_work_item = define_amount_work_item_query.order_by(
+        "-closed_at"
+    ).first()
+    match work_item.task.slug:
+        case "additional-data" if not (
             define_amount_work_item
             and define_amount_work_item.status == "completed"
             and define_amount_work_item.document.answers.filter(
@@ -78,54 +76,63 @@ def _send_work_item_mail(work_item):
                 value="define-amount-decision-reject",
             ).exists()
         ):
-            decision_and_credit_work_item = (
-                work_item.case.work_items.filter(task__slug="decision-and-credit")
-                .order_by("-created_at")
-                .first()
-            )
+            decision_and_credit_work_item = define_amount_work_item_query.order_by(
+                "-created_at"
+            ).first()
             framework_credit = decision_and_credit_work_item.document.answers.get(
                 question__slug="gesprochener-rahmenkredit",
             ).value
-            framework_credit = format_currency(framework_credit, "CHF")
-            selected_email_texts = email_cost_approval
-    elif work_item.task.slug == "complete-document":
-        define_amount_work_item = (
-            work_item.case.work_items.filter(task__slug="define-amount")
-            .order_by("-created_at")
-            .first()
-        )
-        payout_amount_answer = define_amount_work_item.document.answers.filter(
-            question__slug="define-amount-amount-float",
-        ).first()
-        payout_amount = format_currency(
-            payout_amount_answer.value if payout_amount_answer else 0,
-            "CHF",
-        )
-        selected_email_texts = email_payout_amount
-    elif work_item.task.slug in ["review-document", "decision-and-credit"]:
-        selected_email_texts = email_rejection
-        if (
-            work_item.case.document.form.slug in settings.EARLY_CAREER_AWARD_FORM_SLUGS
-            and work_item.task.slug == "decision-and-credit"
-        ):
-            selected_email_texts = email_rejection_early_career_award
+            return (
+                email_cost_approval,
+                {
+                    **format_values,
+                    "framework_credit": format_currency(framework_credit, "CHF"),
+                },
+            )
 
+        case "complete-document":
+            define_amount_work_item = define_amount_work_item_query.order_by(
+                "-created_at"
+            ).first()
+            payout_amount_answer = define_amount_work_item.document.answers.filter(
+                question__slug="define-amount-amount-float",
+            ).first()
+            payout_amount = format_currency(
+                payout_amount_answer.value if payout_amount_answer else 0,
+                "CHF",
+            )
+            return email_payout_amount, {
+                **format_values,
+                "payout_amount": payout_amount,
+            }
+        case "decision-and-credit" if is_eca_form:
+            return email_rejection_early_career_award, format_values
+        case "review-document" | "decision-and-credit":
+            return email_rejection, format_values
+        case _:
+            return email_general, format_values
+
+
+def send_work_item_mail(work_item):
+    """
+    Send the work_item emails.
+
+    This must reside in a separate function in order to be able to patch it in the
+    tests.
+    """
     users = get_users_for_case(work_item.case)
-
+    email_template, format_values = get_mail_template_and_values(work_item)
     for user in users:
-        subject = selected_email_texts.EMAIL_SUBJECTS[user["language"]]
+        subject = email_template.EMAIL_SUBJECTS[user["language"]]
 
-        subject = subject.format(dossier_nr=dossier_nr)
+        subject = subject.format(**format_values)
 
-        body = selected_email_texts.EMAIL_BODIES[user["language"]]
+        body = email_template.EMAIL_BODIES[user["language"]]
 
         body = body.format(
             first_name=user["first-name"] or "",
             last_name=user["last-name"] or "",
-            link=link,
-            dossier_nr=dossier_nr,
-            framework_credit=framework_credit,
-            payout_amount=payout_amount,
+            **format_values,
         )
 
         send_mail(
@@ -148,7 +155,7 @@ def _send_work_item_mail(work_item):
     ],
 )
 def send_new_work_item_mail(sender, work_item, user, **kwargs):
-    _send_work_item_mail(work_item)
+    send_work_item_mail(work_item)
 
 
 @on(post_complete_work_item, raise_exception=True)
@@ -167,7 +174,7 @@ def send_new_work_item_mail(sender, work_item, user, **kwargs):
     ),
 )
 def send_rejection_mail(sender, work_item, user, **kwargs):
-    _send_work_item_mail(work_item)
+    send_work_item_mail(work_item)
 
 
 @on(post_reopen_case, raise_exception=True)
